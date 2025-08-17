@@ -15,7 +15,6 @@ import requests
 from bs4 import BeautifulSoup
 import json
 import os
-import random
 from collections import OrderedDict
 import gc
 
@@ -31,21 +30,6 @@ MAPPING_PATH = "app/models/label_mapping.json"
 
 # -------- FastAPI setup --------
 app = FastAPI()
-
-# Allow your frontend domain
-origins = [
-    "https://card-grader-tau.vercel.app",
-    "http://localhost:3000",  # optional for local dev
-]
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=origins,  # or ["*"] for testing
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
 
 # Global variables - initialize as None to save startup memory
 collection = None
@@ -63,10 +47,27 @@ print(f"Using device: {device}")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=[
+        "https://card-grader-tau.vercel.app",
+        "http://localhost:3000",
+        "http://localhost:3001",
+        "https://localhost:3000",
+        "*"  # Allow all origins as fallback
+    ],
     allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
+    allow_headers=[
+        "Accept",
+        "Accept-Language",
+        "Content-Language",
+        "Content-Type",
+        "Authorization",
+        "X-Requested-With",
+        "Origin",
+        "Access-Control-Request-Method",
+        "Access-Control-Request-Headers",
+    ],
+    expose_headers=["*"],
 )
 
 class Grades(BaseModel):
@@ -102,12 +103,24 @@ def get_clip_model():
     return clip_model, clip_processor
 
 def get_grading_model():
-    """Lazy load grading model only when needed"""
+    """Improved model loading with device consistency"""
     global grading_model, label_mapping
     if grading_model is None:
         print("Loading grading model...")
         grading_model, label_mapping = load_grading_model()
-        print("✅ Grading model loaded")
+        
+        # Ensure model is in eval mode and on correct device
+        grading_model.eval()
+        grading_model = grading_model.to(device)
+        
+        # Disable dropout and batch normalization updates
+        for module in grading_model.modules():
+            if isinstance(module, nn.Dropout):
+                module.eval()
+            elif isinstance(module, (nn.BatchNorm1d, nn.BatchNorm2d)):
+                module.eval()
+        
+        print("✅ Grading model loaded and configured")
     return grading_model, label_mapping
 
 def get_collection():
@@ -232,7 +245,7 @@ def model_output_to_grade(model_output: int) -> int:
     return model_output + 1
 
 def predict_card_grade_with_uncertainty(image_bytes: bytes) -> dict:
-    """Memory-efficient grade prediction"""
+    """Improved grade prediction with better memory management"""
     model, _ = get_grading_model()
     
     try:
@@ -240,29 +253,35 @@ def predict_card_grade_with_uncertainty(image_bytes: bytes) -> dict:
     except (UnidentifiedImageError, OSError, ValueError) as e:
         raise HTTPException(status_code=422, detail=f"Could not read image: {str(e)}")
 
+    # Ensure consistent preprocessing
     input_tensor = transform(image).unsqueeze(0).to(device)
     
     with torch.no_grad():
+        # Ensure model is in eval mode
+        model.eval()
         logits = model(input_tensor)
         probabilities = F.softmax(logits, dim=1)
         predicted_model_output = torch.argmax(logits, dim=1).item()
         predicted_grade = model_output_to_grade(predicted_model_output)
         max_confidence = probabilities[0, predicted_model_output].item()
         
-        # Calculate uncertainty
+        # Improved uncertainty calculation
         entropy = -torch.sum(probabilities * torch.log(probabilities + 1e-8), dim=1).item()
         max_entropy = np.log(NUM_CLASSES)
         normalized_uncertainty = entropy / max_entropy
         
-        # Expected grade
+        # Store probabilities before clearing tensors
+        prob_numpy = probabilities.cpu().numpy()[0]
+        
+        # Expected grade calculation
         model_outputs = torch.arange(0, NUM_CLASSES, dtype=torch.float32).to(device)
         expected_model_output = torch.sum(probabilities * model_outputs).item()
         expected_grade = expected_model_output + 1
 
-    # Clear tensors
+    # Clear tensors AFTER extracting all needed values
     del input_tensor, logits, probabilities, model_outputs
-    torch.cuda.empty_cache() if torch.cuda.is_available() else None
-    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
 
     return {
         'predicted_grade': predicted_grade,
@@ -270,35 +289,54 @@ def predict_card_grade_with_uncertainty(image_bytes: bytes) -> dict:
         'expected_grade': expected_grade,
         'max_confidence': max_confidence,
         'uncertainty': normalized_uncertainty,
-        'probabilities': probabilities.cpu().numpy() if 'probabilities' in locals() else np.zeros(NUM_CLASSES)
+        'probabilities': prob_numpy
     }
 
 def predict_multi_image_grade(image_bytes_list: list) -> dict:
-    """Process images sequentially to save memory"""
+    """Improved multi-image processing with better ensemble logic"""
     individual_results = []
-    all_probabilities = []
-
-    # Process one image at a time and clear memory between
+    
+    # Process images with consistent model state
+    model, _ = get_grading_model()
+    model.eval()  # Ensure consistent eval mode
+    
     for i, img_bytes in enumerate(image_bytes_list):
         result = predict_card_grade_with_uncertainty(img_bytes)
         individual_results.append(result)
-        all_probabilities.append(result['probabilities'])
-        
-        # Force garbage collection between images
-        gc.collect()
+        print(f"Image {i}: Grade={result['predicted_grade']}, Confidence={result['max_confidence']:.3f}")
 
+    # Extract probabilities and apply better weighting
+    all_probabilities = np.array([r['probabilities'] for r in individual_results])
+    
+    # Adaptive weighting based on confidence
+    confidences = np.array([r['max_confidence'] for r in individual_results])
+    uncertainties = np.array([r['uncertainty'] for r in individual_results])
+    
+    # Weight by confidence (higher confidence = higher weight)
+    confidence_weights = confidences / np.sum(confidences)
+    
+    # Alternative: Use predefined weights but adjust based on confidence
+    base_weights = np.array([0.35, 0.35, 0.15, 0.15])  # front, back, topLeft, bottomRight
+    
+    # Blend base weights with confidence weights
+    final_weights = 0.7 * base_weights + 0.3 * confidence_weights
+    final_weights = final_weights / np.sum(final_weights)  # Normalize
+    
+    print(f"Confidence weights: {confidence_weights}")
+    print(f"Final weights: {final_weights}")
+    
     # Weighted ensemble
-    weights = [0.35, 0.35, 0.15, 0.15]
-    weighted_probs = np.average(all_probabilities, axis=0, weights=weights)
+    weighted_probs = np.average(all_probabilities, axis=0, weights=final_weights)
     ensemble_model_output = np.argmax(weighted_probs)
     ensemble_predicted_grade = model_output_to_grade(ensemble_model_output)
     ensemble_confidence = weighted_probs[ensemble_model_output]
     
+    # Improved expected grade calculation
     expected_grades = [r['expected_grade'] for r in individual_results]
-    weighted_expected_grade = np.average(expected_grades, weights=weights)
+    weighted_expected_grade = np.average(expected_grades, weights=final_weights)
+    
     predicted_grades = [r['predicted_grade'] for r in individual_results]
-    uncertainties = [r['uncertainty'] for r in individual_results]
-    weighted_uncertainty = np.average(uncertainties, weights=weights)
+    weighted_uncertainty = np.average(uncertainties, weights=final_weights)
 
     return {
         'overall_grade': ensemble_predicted_grade,
@@ -309,8 +347,129 @@ def predict_multi_image_grade(image_bytes_list: list) -> dict:
         'individual_grades': predicted_grades,
         'front_grade': predicted_grades[0],
         'back_grade': predicted_grades[1],
-        'corner_grades': predicted_grades[2:4]
+        'corner_grades': predicted_grades[2:4],
+        'final_weights': final_weights.tolist()
     }
+
+def calculate_component_grades_improved(grade_results: dict) -> tuple[dict, float]:
+    """Improved component grade calculation"""
+    individual_grades = grade_results['individual_grades']
+    individual_results = grade_results['individual_results']
+    
+    front_grade = individual_grades[0]
+    back_grade = individual_grades[1] 
+    top_left_grade = individual_grades[2]
+    bottom_right_grade = individual_grades[3]
+    
+    # Calculate average uncertainty for variation logic
+    avg_uncertainty = np.mean([r['uncertainty'] for r in individual_results])
+    print(f"Average uncertainty: {avg_uncertainty:.3f}")
+    
+    # Corner grade calculation
+    corner_grade = int(round(np.mean([top_left_grade, bottom_right_grade])))
+    
+    # More sophisticated component mapping
+    grades = {
+        "centering": front_grade,  # Front image best shows centering
+        "edges": back_grade,       # Back image for edge assessment
+        "corners": corner_grade,   # Average of corner close-ups
+        "surface": int(round(np.mean([front_grade, back_grade])))  # Surface from front/back
+    }
+    
+    # Apply realistic constraints
+    # Corners typically grade lower due to damage
+    if corner_grade < min(front_grade, back_grade) - 2:
+        # Severe corner damage affects other grades
+        grades["centering"] = min(grades["centering"], corner_grade + 2)
+        grades["edges"] = min(grades["edges"], corner_grade + 1)
+        grades["surface"] = min(grades["surface"], corner_grade + 1)
+    
+    # Edge damage affects surface
+    if grades["edges"] < grades["surface"] - 1:
+        grades["surface"] = min(grades["surface"], grades["edges"] + 1)
+    
+    # Ensure all grades are within bounds
+    for component in grades:
+        grades[component] = max(1, min(10, grades[component]))
+    
+    return grades, avg_uncertainty
+
+def calculate_final_overall_grade(grades: dict, grade_results: dict, avg_uncertainty: float) -> int:
+    """Improved final grade calculation"""
+    overall_grade_from_model = grade_results['overall_grade']
+    overall_confidence = grade_results['ensemble_confidence']
+    
+    # Component-based grade calculation
+    # Professional grading typically weights surface highest
+    component_weights = {
+        "centering": 0.15,  # Reduced from 0.25
+        "edges": 0.20,      # Increased 
+        "corners": 0.25,    # Increased (corners are critical)
+        "surface": 0.40     # Increased (surface is most important)
+    }
+    
+    component_weighted_score = sum(
+        grades[component] * weight 
+        for component, weight in component_weights.items()
+    )
+    
+    print(f"Component weighted score: {component_weighted_score:.2f}")
+    print(f"Model prediction: {overall_grade_from_model}")
+    print(f"Model confidence: {overall_confidence:.3f}")
+    
+    # Improved blending logic
+    model_component_diff = abs(overall_grade_from_model - component_weighted_score)
+    
+    if overall_confidence > 0.6 and model_component_diff <= 1.0:
+        # High confidence and close agreement - use model
+        final_grade = overall_grade_from_model
+        print(f"Using model prediction (high confidence, close agreement)")
+        
+    elif overall_confidence > 0.4 and model_component_diff <= 2.0:
+        # Moderate confidence - weighted blend favoring model
+        blend_weight = 0.7  # Higher weight on model
+        final_grade = blend_weight * overall_grade_from_model + (1 - blend_weight) * component_weighted_score
+        print(f"Blending: {blend_weight} model + {1-blend_weight} components = {final_grade:.2f}")
+        
+    elif overall_confidence > 0.25:
+        # Lower confidence - favor components
+        blend_weight = 0.3  # Lower weight on model
+        final_grade = blend_weight * overall_grade_from_model + (1 - blend_weight) * component_weighted_score
+        print(f"Low confidence blending: {final_grade:.2f}")
+        
+    else:
+        # Very low confidence - use components with expected grade as fallback
+        if 'weighted_expected_grade' in grade_results:
+            expected_grade = grade_results['weighted_expected_grade']
+            final_grade = 0.6 * component_weighted_score + 0.4 * expected_grade
+            print(f"Very low confidence: components + expected = {final_grade:.2f}")
+        else:
+            final_grade = component_weighted_score
+            print(f"Using pure component score: {final_grade:.2f}")
+    
+    # Apply grade caps based on worst component (more conservative)
+    min_component = min(grades.values())
+    
+    # Grade caps - more realistic
+    if min_component == 1:
+        max_cap = 2  # More restrictive
+    elif min_component <= 2:
+        max_cap = 4
+    elif min_component <= 3:
+        max_cap = 6
+    elif min_component <= 5:
+        max_cap = 8
+    else:
+        max_cap = 10
+    
+    print(f"Grade cap based on worst component ({min_component}): {max_cap}")
+    
+    # Apply cap if significantly higher
+    if final_grade > max_cap and (final_grade - max_cap) > 0.5:
+        print(f"Applying cap: {final_grade:.1f} -> {max_cap}")
+        final_grade = max_cap
+    
+    return max(1, min(10, int(round(final_grade))))
 
 def get_pricecharting_value(card_name: str, edition: str, overall_grade: int) -> float:
     """Lightweight value estimation"""
@@ -344,6 +503,11 @@ def get_pricecharting_value(card_name: str, edition: str, overall_grade: int) ->
         print(f"Scraper error: {e}")
         return 0.0
 
+@app.options("/appraise")
+async def appraise_options():
+    """Handle OPTIONS preflight request for CORS"""
+    return {"message": "OK"}
+
 @app.get("/health")
 async def health_check():
     """Lightweight health check"""
@@ -356,7 +520,7 @@ async def appraise(
     topLeft: UploadFile = File(...),
     bottomRight: UploadFile = File(...),
 ):
-    """Memory-efficient appraisal endpoint"""
+    """Improved appraisal endpoint with fixed grading logic"""
     
     # Read images
     image_bytes_list = []
@@ -400,119 +564,26 @@ async def appraise(
     except Exception as e:
         print(f"Error querying Milvus: {e}")
 
-    # Grade prediction
+    # Grade prediction with improved ensemble
     grade_results = predict_multi_image_grade(image_bytes_list)
-    overall_grade_from_model = grade_results['overall_grade']
+    
+    print(f"Individual image predictions: {grade_results['individual_grades']}")
+    print(f"Ensemble prediction: {grade_results['overall_grade']} (confidence: {grade_results['ensemble_confidence']:.3f})")
+
+    # Calculate component grades with improved logic
+    grades, avg_uncertainty = calculate_component_grades_improved(grade_results)
+    print(f"Component grades: {grades}")
+
+    # Calculate final overall grade with improved blending
+    final_overall_grade = calculate_final_overall_grade(grades, grade_results, avg_uncertainty)
+    
+    # Use ensemble confidence as final confidence
     overall_confidence = float(grade_results['ensemble_confidence'])
-    individual_grades = grade_results['individual_grades']
-
-    def clamp_grade(grade):
-        return max(1, min(10, int(round(grade))))
-
-    front_grade, back_grade, top_left_grade, bottom_right_grade = [clamp_grade(g) for g in individual_grades]
-
-    print(f"Individual image predictions: Front={front_grade}, Back={back_grade}, TopLeft={top_left_grade}, BottomRight={bottom_right_grade}")
-
-    # If all predictions are identical, add realistic variation
-    if len(set(individual_grades)) == 1:
-        print("All predictions identical, adding realistic component variation...")
-        base_grade = front_grade
-        individual_results = grade_results['individual_results']
-        avg_uncertainty = np.mean([r['uncertainty'] for r in individual_results])
-
-        if avg_uncertainty > 0.8:
-            variation_range = 2
-        elif avg_uncertainty > 0.6:
-            variation_range = 1
-        else:
-            variation_range = 1
-
-        corner_penalty = min(variation_range, max(0, int(avg_uncertainty * 3)))
-        surface_bonus = min(1, max(0, int((1 - avg_uncertainty) * 2)))
-
-        grades = {
-            "centering": clamp_grade(base_grade + random.choice([-1, 0, 1]) if variation_range > 0 else base_grade),
-            "edges": clamp_grade(base_grade + random.choice([-1, 0]) if variation_range > 0 else base_grade),
-            "corners": clamp_grade(base_grade - corner_penalty),
-            "surface": clamp_grade(base_grade + surface_bonus)
-        }
-        print(f"Applied variation - Base: {base_grade}, Corner penalty: -{corner_penalty}, Surface bonus: +{surface_bonus}")
-
-    else:
-        # Use individual image predictions for components
-        corner_grade = clamp_grade(np.mean([top_left_grade, bottom_right_grade]))
-        grades = {
-            "centering": front_grade,
-            "edges": back_grade,
-            "corners": corner_grade,
-            "surface": clamp_grade(np.mean([front_grade, back_grade]))
-        }
-        # Adjust for corner damage
-        if corner_grade < front_grade - 1:
-            grades["centering"] = min(grades["centering"], corner_grade + 1)
-        if corner_grade < back_grade - 1:
-            grades["edges"] = min(grades["edges"], corner_grade + 1)
-
-    print(f"Final component grades: {grades}")
-
-    # Calculate component-based overall grade
-    min_component_grade = min(grades.values())
-    max_component_grade = max(grades.values())
-
-    print(f"Component grade range: {min_component_grade} - {max_component_grade}")
-    print(f"Model ensemble prediction: {overall_grade_from_model}")
-    print(f"Ensemble confidence: {overall_confidence:.4f}")
-
-    component_weighted_score = (
-        grades["centering"] * 0.25 +
-        grades["edges"] * 0.15 +
-        grades["corners"] * 0.2 +
-        grades["surface"] * 0.3
-    )
-    print(f"Component weighted score: {component_weighted_score:.2f}")
-
-    # Blend logic
-    if overall_confidence > 0.4:
-        model_component_diff = abs(overall_grade_from_model - component_weighted_score)
-        if model_component_diff <= 1.5:
-            final_overall_grade = overall_grade_from_model
-            print(f"Using model prediction {overall_grade_from_model} (good confidence, close to components)")
-        else:
-            final_overall_grade = 0.6 * component_weighted_score + 0.4 * overall_grade_from_model
-            print(f"Blending: components {component_weighted_score:.1f} + model {overall_grade_from_model} = {final_overall_grade:.1f}")
-    elif overall_confidence > 0.25:
-        final_overall_grade = 0.7 * component_weighted_score + 0.3 * overall_grade_from_model
-        print(f"Moderate confidence, blending toward components: {final_overall_grade:.1f}")
-    else:
-        if 'weighted_expected_grade' in grade_results:
-            expected_grade = grade_results['weighted_expected_grade']
-            final_overall_grade = 0.5 * component_weighted_score + 0.5 * expected_grade
-            print(f"Low confidence, using expected grade: components {component_weighted_score:.1f} + expected {expected_grade:.1f} = {final_overall_grade:.1f}")
-        else:
-            final_overall_grade = component_weighted_score
-            print(f"Low confidence, using component score: {final_overall_grade:.1f}")
-
-    if min_component_grade <= 1:
-        max_cap = 3
-    elif min_component_grade <= 3:
-        max_cap = 6
-    elif min_component_grade <= 5:
-        max_cap = 8
-    else:
-        max_cap = 10
-    print(f"Max cap based on worst component ({min_component_grade}): {max_cap}")
-
-    # Only apply cap if it's significantly lower than our calculated grade
-    if final_overall_grade > max_cap and (final_overall_grade - max_cap) > 1:
-        print(f"Applying cap: {final_overall_grade:.1f} -> {max_cap}")
-        final_overall_grade = max_cap
-
-    final_overall_grade = clamp_grade(final_overall_grade)
 
     # Value estimation
     estimated_value = get_pricecharting_value(card_name, card_edition, final_overall_grade)
 
-    print(f"Final computed overall grade: {final_overall_grade} with confidence {overall_confidence:.4f}")
+    print(f"Final overall grade: {final_overall_grade} with confidence {overall_confidence:.4f}")
     print(f"Component grades: {grades}")
 
     # Force cleanup

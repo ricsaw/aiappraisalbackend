@@ -3,11 +3,15 @@ uvicorn
 torch
 torchvision
 pillow
+pillow-avif-plugin
 pytesseract
 requests
+beautifulsoup4
 fuzzywuzzy
 python-Levenshtein
 matplotlib
 seaborn
 transformers
 pymilvus
+scikit-learn
+numpy

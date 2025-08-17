@@ -1,0 +1,9 @@
+fastapi
+uvicorn
+torch
+torchvision
+pillow
+pytesseract
+requests
+fuzzywuzzy
+python-Levenshtein

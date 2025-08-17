@@ -7,3 +7,5 @@ pytesseract
 requests
 fuzzywuzzy
 python-Levenshtein
+matplotlib
+seaborn

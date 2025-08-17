@@ -32,15 +32,15 @@ MAPPING_PATH = "app/models/label_mapping.json"
 # -------- FastAPI setup --------
 app = FastAPI()
 
-# allow your frontend domain
+# Allow your frontend domain
 origins = [
-    "https://card-grader-tau.vercel.app",  # your Vercel app
-    "http://localhost:3000",               # local dev
+    "https://card-grader-tau.vercel.app",
+    "http://localhost:3000",  # optional for local dev
 ]
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=origins,  # or ["*"] if you want to allow everything (not recommended)
+    allow_origins=origins,  # or ["*"] for testing
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],

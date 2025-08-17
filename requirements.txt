@@ -9,3 +9,4 @@ fuzzywuzzy
 python-Levenshtein
 matplotlib
 seaborn
+transformers

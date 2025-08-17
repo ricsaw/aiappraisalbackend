@@ -10,3 +10,4 @@ python-Levenshtein
 matplotlib
 seaborn
 transformers
+pymilvus

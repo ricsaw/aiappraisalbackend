@@ -51,7 +51,13 @@ class AppraisalResult(BaseModel):
     confidence: float
 
 # -------- Milvus setup --------
-connections.connect("default", host="localhost", port="19530")
+ZILLIZ_HOST = "https://in03-0305f9ddf217854.serverless.gcp-us-west1.cloud.zilliz.com"
+ZILLIZ_TOKEN = "923738adce800b1f016901dcd62da0fa577671d54ef3f5b2a012e4d19ab57187a9d7cb45397684680e43925ebf1f32ca8b4b02b4"
+connections.connect(
+    alias="zilliz",
+    uri=ZILLIZ_HOST,
+    token=ZILLIZ_TOKEN
+)
 collection = Collection("pokemon_cards")
 
 # -------- Device --------
